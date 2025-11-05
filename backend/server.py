@@ -12,14 +12,8 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
-# Emergent integrations - optional for demo
-try:
-    from emergentintegrations.llm.chat import LlmChat, UserMessage
-    from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
-    EMERGENT_AVAILABLE = True
-except ImportError:
-    EMERGENT_AVAILABLE = False
-    import stripe as stripe_lib
+from openai import AsyncOpenAI
+import stripe
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -35,8 +29,15 @@ db = client[os.environ['DB_NAME']]
 # Configuration
 JWT_SECRET = os.environ.get('JWT_SECRET', 'dev-secret-key-change-in-production')
 JWT_ALGORITHM = "HS256"
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', 'demo-key')
-STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY', 'sk_test_demo')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY', '')
+
+# Initialize OpenAI client
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Initialize Stripe
+if STRIPE_API_KEY:
+    stripe.api_key = STRIPE_API_KEY
 
 security = HTTPBearer()
 
@@ -595,33 +596,39 @@ async def generate_matches(request: Request, current_user: dict = Depends(get_cu
         matches = []
         for campaign in campaigns[:10]:  # Top 10 campaigns
             # Calculate match score
-            if EMERGENT_AVAILABLE:
+            if openai_client:
                 try:
-                    chat = LlmChat(
-                        api_key=EMERGENT_LLM_KEY,
-                        session_id=f"match_{current_user['id']}_{campaign['id']}",
-                        system_message="You are an AI matchmaking expert for influencer marketing. Provide match scores and explanations."
-                    ).with_model("openai", "gpt-4o-mini")
+                    # Use OpenAI API for AI-powered matching
+                    prompt = f"""Analyze this influencer-campaign match:
 
-                    prompt = f"""Analyze this match:
-                    Influencer: {profile.get('bio', 'N/A')}
-                    Influencer niches: {', '.join(profile.get('niche_tags', []))}
-                    Follower count: {profile.get('follower_count', 0)}
-                    Engagement rate: {profile.get('engagement_rate', 0)}%
+Influencer Profile:
+- Bio: {profile.get('bio', 'N/A')}
+- Niches: {', '.join(profile.get('niche_tags', []))}
+- Follower count: {profile.get('follower_count', 0):,}
+- Engagement rate: {profile.get('engagement_rate', 0)}%
 
-                    Campaign: {campaign['title']}
-                    Campaign description: {campaign['description']}
-                    Target niches: {', '.join(campaign.get('niche_tags', []))}
-                    Budget: ${campaign['budget']}
+Campaign Details:
+- Title: {campaign['title']}
+- Description: {campaign['description']}
+- Target niches: {', '.join(campaign.get('niche_tags', []))}
+- Budget: ${campaign['budget']:,}
 
-                    Provide a match score (0-100) and brief explanation (max 50 words).
-                    Format: SCORE: [number]\nEXPLANATION: [text]"""
+Provide a match score (0-100) and brief explanation (max 50 words).
+Format: SCORE: [number]\nEXPLANATION: [text]"""
 
-                    message = UserMessage(text=prompt)
-                    response = await chat.send_message(message)
+                    response = await openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "You are an AI matchmaking expert for influencer marketing. Provide match scores and explanations."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.7,
+                        max_tokens=150
+                    )
 
                     # Parse response
-                    parts = response.split("EXPLANATION:")
+                    response_text = response.choices[0].message.content
+                    parts = response_text.split("EXPLANATION:")
                     score_part = parts[0].replace("SCORE:", "").strip()
                     score = int(''.join(filter(str.isdigit, score_part)))
                     explanation = parts[1].strip() if len(parts) > 1 else "Good match based on niche alignment"
@@ -636,7 +643,7 @@ async def generate_matches(request: Request, current_user: dict = Depends(get_cu
                         profile.get('pricing', 0)
                     )
             else:
-                # Use fallback scoring
+                # Use fallback scoring when OpenAI is not configured
                 score, explanation = calculate_match_score(
                     profile.get('niche_tags', []),
                     campaign.get('niche_tags', []),
@@ -675,31 +682,37 @@ async def generate_matches(request: Request, current_user: dict = Depends(get_cu
         matches = []
         for influencer in influencers[:10]:  # Top 10 influencers
             # Calculate match score
-            if EMERGENT_AVAILABLE:
+            if openai_client:
                 try:
-                    chat = LlmChat(
-                        api_key=EMERGENT_LLM_KEY,
-                        session_id=f"match_{campaign['id']}_{influencer['user_id']}",
-                        system_message="You are an AI matchmaking expert for influencer marketing."
-                    ).with_model("openai", "gpt-4o-mini")
+                    # Use OpenAI API for AI-powered matching
+                    prompt = f"""Analyze this campaign-influencer match:
 
-                    prompt = f"""Analyze this match:
-                    Campaign: {campaign['title']}
-                    Campaign niches: {', '.join(campaign.get('niche_tags', []))}
-                    Budget: ${campaign['budget']}
+Campaign Details:
+- Title: {campaign['title']}
+- Target niches: {', '.join(campaign.get('niche_tags', []))}
+- Budget: ${campaign['budget']:,}
 
-                    Influencer niches: {', '.join(influencer.get('niche_tags', []))}
-                    Followers: {influencer.get('follower_count', 0)}
-                    Engagement: {influencer.get('engagement_rate', 0)}%
-                    Pricing: ${influencer.get('pricing', 0)}
+Influencer Profile:
+- Niches: {', '.join(influencer.get('niche_tags', []))}
+- Followers: {influencer.get('follower_count', 0):,}
+- Engagement rate: {influencer.get('engagement_rate', 0)}%
+- Pricing: ${influencer.get('pricing', 0):,}
 
-                    Match score (0-100) and explanation (max 50 words).
-                    Format: SCORE: [number]\nEXPLANATION: [text]"""
+Match score (0-100) and explanation (max 50 words).
+Format: SCORE: [number]\nEXPLANATION: [text]"""
 
-                    message = UserMessage(text=prompt)
-                    response = await chat.send_message(message)
+                    response = await openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "You are an AI matchmaking expert for influencer marketing."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.7,
+                        max_tokens=150
+                    )
 
-                    parts = response.split("EXPLANATION:")
+                    response_text = response.choices[0].message.content
+                    parts = response_text.split("EXPLANATION:")
                     score = int(''.join(filter(str.isdigit, parts[0].replace("SCORE:", "").strip())))
                     explanation = parts[1].strip() if len(parts) > 1 else "Good match"
                 except Exception as e:
@@ -713,7 +726,7 @@ async def generate_matches(request: Request, current_user: dict = Depends(get_cu
                         influencer.get('pricing', 0)
                     )
             else:
-                # Use fallback scoring
+                # Use fallback scoring when OpenAI is not configured
                 score, explanation = calculate_match_score(
                     influencer.get('niche_tags', []),
                     campaign.get('niche_tags', []),
@@ -854,6 +867,9 @@ async def create_payment(payment_data: PaymentRequest, request: Request, current
     if current_user["user_type"] != "brand":
         raise HTTPException(status_code=403, detail="Only brands can make payments")
 
+    if not STRIPE_API_KEY:
+        raise HTTPException(status_code=503, detail="Payment processing not configured")
+
     # Get campaign
     campaign = await db.campaigns.find_one({"id": payment_data.campaign_id}, {"_id": 0})
     if not campaign:
@@ -869,92 +885,133 @@ async def create_payment(payment_data: PaymentRequest, request: Request, current
 
     amount = influencer.get("pricing", 1000.0)
 
-    # Create Stripe checkout
-    host_url = str(request.base_url).rstrip('/')
-    webhook_url = f"{host_url}/api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-
     # Use host from request headers for success/cancel URLs
-    origin = request.headers.get("origin", host_url)
-    success_url = f"{origin}/payment/success?session_id={{{{CHECKOUT_SESSION_ID}}}}"
+    origin = request.headers.get("origin", str(request.base_url).rstrip('/'))
+    success_url = f"{origin}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{origin}/payment/cancel"
 
-    checkout_request = CheckoutSessionRequest(
-        amount=amount,
-        currency="usd",
-        success_url=success_url,
-        cancel_url=cancel_url,
-        metadata={
-            "campaign_id": payment_data.campaign_id,
-            "influencer_id": payment_data.influencer_id,
-            "brand_id": current_user["id"],
-            "milestone": payment_data.milestone_description
-        }
-    )
+    try:
+        # Create Stripe checkout session
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'usd',
+                    'unit_amount': int(amount * 100),  # Convert to cents
+                    'product_data': {
+                        'name': f'Payment for Campaign: {campaign["title"]}',
+                        'description': payment_data.milestone_description or 'Influencer collaboration payment',
+                    },
+                },
+                'quantity': 1,
+            }],
+            mode='payment',
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "campaign_id": payment_data.campaign_id,
+                "influencer_id": payment_data.influencer_id,
+                "brand_id": current_user["id"],
+                "milestone": payment_data.milestone_description
+            }
+        )
 
-    session = await stripe_checkout.create_checkout_session(checkout_request)
+        # Create transaction record
+        transaction = Transaction(
+            campaign_id=payment_data.campaign_id,
+            influencer_id=payment_data.influencer_id,
+            brand_id=current_user["id"],
+            amount=amount,
+            milestone_description=payment_data.milestone_description,
+            stripe_session_id=session.id,
+            status="pending",
+            payment_status="initiated"
+        )
+        txn_doc = transaction.model_dump()
+        txn_doc["created_at"] = txn_doc["created_at"].isoformat()
+        await db.transactions.insert_one(txn_doc)
 
-    # Create transaction record
-    transaction = Transaction(
-        campaign_id=payment_data.campaign_id,
-        influencer_id=payment_data.influencer_id,
-        brand_id=current_user["id"],
-        amount=amount,
-        milestone_description=payment_data.milestone_description,
-        stripe_session_id=session.session_id,
-        status="pending",
-        payment_status="initiated"
-    )
-    txn_doc = transaction.model_dump()
-    txn_doc["created_at"] = txn_doc["created_at"].isoformat()
-    await db.transactions.insert_one(txn_doc)
-
-    return {"url": session.url, "session_id": session.session_id}
+        return {"url": session.url, "session_id": session.id}
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Payment processing error: {str(e)}")
 
 @api_router.get("/payments/status/{session_id}")
 async def get_payment_status(session_id: str, current_user: dict = Depends(get_current_user)):
-    # Initialize Stripe
-    host_url = os.environ.get('REACT_APP_BACKEND_URL', 'http://localhost:8001')
-    webhook_url = f"{host_url}/api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+    if not STRIPE_API_KEY:
+        raise HTTPException(status_code=503, detail="Payment processing not configured")
 
-    # Get status from Stripe
-    checkout_status = await stripe_checkout.get_checkout_status(session_id)
+    try:
+        # Get status from Stripe
+        session = stripe.checkout.Session.retrieve(session_id)
 
-    # Update transaction
-    await db.transactions.update_one(
-        {"stripe_session_id": session_id},
-        {"$set": {
-            "payment_status": checkout_status.payment_status,
-            "status": "completed" if checkout_status.payment_status == "paid" else "pending"
-        }}
-    )
+        payment_status = session.payment_status
 
-    return checkout_status
+        # Update transaction
+        await db.transactions.update_one(
+            {"stripe_session_id": session_id},
+            {"$set": {
+                "payment_status": payment_status,
+                "status": "completed" if payment_status == "paid" else "pending"
+            }}
+        )
+
+        return {
+            "session_id": session.id,
+            "payment_status": payment_status,
+            "amount_total": session.amount_total / 100 if session.amount_total else 0,  # Convert from cents
+            "currency": session.currency,
+            "customer_email": session.customer_details.email if session.customer_details else None
+        }
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Payment status error: {str(e)}")
 
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
+    if not STRIPE_API_KEY:
+        raise HTTPException(status_code=503, detail="Payment processing not configured")
+
     body = await request.body()
     signature = request.headers.get("Stripe-Signature")
 
-    host_url = str(request.base_url).rstrip('/')
-    webhook_url = f"{host_url}/api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+    # Get webhook secret from environment (configure in Stripe Dashboard)
+    webhook_secret = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 
     try:
-        webhook_response = await stripe_checkout.handle_webhook(body, signature)
+        if webhook_secret:
+            # Verify webhook signature
+            event = stripe.Webhook.construct_event(
+                payload=body,
+                sig_header=signature,
+                secret=webhook_secret
+            )
+        else:
+            # Parse without verification (development mode)
+            logger.warning("Stripe webhook signature verification disabled - set STRIPE_WEBHOOK_SECRET")
+            import json
+            event = json.loads(body)
 
-        # Update transaction based on webhook
-        if webhook_response.payment_status == "paid":
+        # Handle the event
+        if event['type'] == 'checkout.session.completed':
+            session = event['data']['object']
+            session_id = session['id']
+            payment_status = session.get('payment_status', 'unpaid')
+
+            # Update transaction based on webhook
             await db.transactions.update_one(
-                {"stripe_session_id": webhook_response.session_id},
+                {"stripe_session_id": session_id},
                 {"$set": {
-                    "payment_status": "paid",
-                    "status": "completed"
+                    "payment_status": payment_status,
+                    "status": "completed" if payment_status == "paid" else "pending"
                 }}
             )
+            logger.info(f"Payment completed for session: {session_id}")
 
         return {"status": "success"}
+    except stripe.error.SignatureVerificationError as e:
+        logger.error(f"Webhook signature verification failed: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))

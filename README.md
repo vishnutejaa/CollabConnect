@@ -37,7 +37,7 @@ CollabConnect is a modern web application that connects social media influencers
 - **Framework**: FastAPI (Python)
 - **Database**: MongoDB (async via Motor)
 - **Authentication**: JWT + bcrypt
-- **AI/LLM**: Emergent Integrations API (GPT-4o-mini)
+- **AI/LLM**: OpenAI API (GPT-4o-mini)
 - **Payments**: Stripe
 - **Rate Limiting**: SlowAPI
 
@@ -60,8 +60,8 @@ CollabConnect is a modern web application that connects social media influencers
 - **Node.js** 16+
 - **MongoDB** 4.4+
 - **Yarn** or npm
-- **Stripe Account** (for payments)
-- **Emergent LLM API Key** (for AI matching)
+- **Stripe Account** (for payments, optional)
+- **OpenAI API Key** (for AI matching, optional - falls back to algorithm)
 
 ### 1. Clone the Repository
 
@@ -94,8 +94,9 @@ nano .env  # or use your preferred editor
 MONGO_URL=mongodb://localhost:27017
 DB_NAME=collabconnect
 JWT_SECRET=your-secret-key-min-256-bits
-EMERGENT_LLM_KEY=your-emergent-api-key
-STRIPE_API_KEY=sk_test_your_stripe_key
+OPENAI_API_KEY=sk-your-openai-api-key  # Optional - uses fallback algorithm if not set
+STRIPE_API_KEY=sk_test_your_stripe_key  # Optional - for payment processing
+STRIPE_WEBHOOK_SECRET=whsec_your_webhook_secret  # Optional - from Stripe Dashboard
 CORS_ORIGINS=http://localhost:3000
 ```
 
@@ -399,8 +400,9 @@ rm -rf node_modules && yarn install
 - Check backend is running on correct port
 
 **5. AI matching fails**
-- Verify `EMERGENT_LLM_KEY` is valid
-- Check API quota/limits
+- Verify `OPENAI_API_KEY` is valid (get from platform.openai.com)
+- Check API quota/limits in OpenAI dashboard
+- App falls back to algorithm-based matching if OpenAI is not configured
 - Review logs for specific error messages
 
 ---
@@ -473,7 +475,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - **React** team for the UI library
 - **Radix UI** for accessible components
 - **Stripe** for payment processing
-- **Emergent Integrations** for LLM API
+- **OpenAI** for GPT-4o-mini AI matching
 - **MongoDB** for the database platform
 
 ---

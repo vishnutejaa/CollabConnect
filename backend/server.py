@@ -12,8 +12,14 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
-from emergentintegrations.llm.chat import LlmChat, UserMessage
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+# Emergent integrations - optional for demo
+try:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage
+    from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+    EMERGENT_AVAILABLE = True
+except ImportError:
+    EMERGENT_AVAILABLE = False
+    import stripe as stripe_lib
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -27,10 +33,10 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 # Configuration
-JWT_SECRET = os.environ['JWT_SECRET']
+JWT_SECRET = os.environ.get('JWT_SECRET', 'dev-secret-key-change-in-production')
 JWT_ALGORITHM = "HS256"
-EMERGENT_LLM_KEY = os.environ['EMERGENT_LLM_KEY']
-STRIPE_API_KEY = os.environ['STRIPE_API_KEY']
+EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', 'demo-key')
+STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY', 'sk_test_demo')
 
 security = HTTPBearer()
 
@@ -552,6 +558,31 @@ async def get_campaign_applications(campaign_id: str, current_user: dict = Depen
 
 # ============ MATCHMAKING ROUTES ============
 
+def calculate_match_score(influencer_niches: List[str], campaign_niches: List[str],
+                         influencer_followers: int, campaign_budget: float,
+                         influencer_engagement: float, influencer_pricing: float) -> tuple:
+    """Fallback match scoring when AI is not available"""
+    # Niche overlap score (0-50 points)
+    common_niches = set(influencer_niches) & set(campaign_niches)
+    niche_score = min(len(common_niches) * 25, 50)
+
+    # Budget alignment (0-30 points)
+    budget_ratio = min(campaign_budget / max(influencer_pricing, 1), 3)
+    budget_score = min(budget_ratio * 10, 30)
+
+    # Engagement quality (0-20 points)
+    engagement_score = min(influencer_engagement * 3, 20)
+
+    total_score = int(niche_score + budget_score + engagement_score)
+
+    explanation = f"Match based on {len(common_niches)} shared niche(s)"
+    if budget_ratio >= 1:
+        explanation += f", budget alignment (${campaign_budget:,.0f})"
+    if influencer_engagement > 5:
+        explanation += f", strong engagement ({influencer_engagement:.1f}%)"
+
+    return total_score, explanation
+
 @api_router.post("/matches/generate")
 @limiter.limit("5/hour")  # Limit to 5 match generations per hour
 async def generate_matches(request: Request, current_user: dict = Depends(get_current_user)):
@@ -563,40 +594,57 @@ async def generate_matches(request: Request, current_user: dict = Depends(get_cu
 
         matches = []
         for campaign in campaigns[:10]:  # Top 10 campaigns
-            # Calculate match score using AI
-            chat = LlmChat(
-                api_key=EMERGENT_LLM_KEY,
-                session_id=f"match_{current_user['id']}_{campaign['id']}",
-                system_message="You are an AI matchmaking expert for influencer marketing. Provide match scores and explanations."
-            ).with_model("openai", "gpt-4o-mini")
+            # Calculate match score
+            if EMERGENT_AVAILABLE:
+                try:
+                    chat = LlmChat(
+                        api_key=EMERGENT_LLM_KEY,
+                        session_id=f"match_{current_user['id']}_{campaign['id']}",
+                        system_message="You are an AI matchmaking expert for influencer marketing. Provide match scores and explanations."
+                    ).with_model("openai", "gpt-4o-mini")
 
-            prompt = f"""Analyze this match:
-            Influencer: {profile.get('bio', 'N/A')}
-            Influencer niches: {', '.join(profile.get('niche_tags', []))}
-            Follower count: {profile.get('follower_count', 0)}
-            Engagement rate: {profile.get('engagement_rate', 0)}%
+                    prompt = f"""Analyze this match:
+                    Influencer: {profile.get('bio', 'N/A')}
+                    Influencer niches: {', '.join(profile.get('niche_tags', []))}
+                    Follower count: {profile.get('follower_count', 0)}
+                    Engagement rate: {profile.get('engagement_rate', 0)}%
 
-            Campaign: {campaign['title']}
-            Campaign description: {campaign['description']}
-            Target niches: {', '.join(campaign.get('niche_tags', []))}
-            Budget: ${campaign['budget']}
+                    Campaign: {campaign['title']}
+                    Campaign description: {campaign['description']}
+                    Target niches: {', '.join(campaign.get('niche_tags', []))}
+                    Budget: ${campaign['budget']}
 
-            Provide a match score (0-100) and brief explanation (max 50 words).
-            Format: SCORE: [number]\nEXPLANATION: [text]"""
+                    Provide a match score (0-100) and brief explanation (max 50 words).
+                    Format: SCORE: [number]\nEXPLANATION: [text]"""
 
-            message = UserMessage(text=prompt)
-            response = await chat.send_message(message)
+                    message = UserMessage(text=prompt)
+                    response = await chat.send_message(message)
 
-            # Parse response
-            try:
-                parts = response.split("EXPLANATION:")
-                score_part = parts[0].replace("SCORE:", "").strip()
-                score = int(''.join(filter(str.isdigit, score_part)))
-                explanation = parts[1].strip() if len(parts) > 1 else "Good match based on niche alignment"
-            except Exception as e:
-                logger.warning(f"Failed to parse AI match response for influencer {current_user['id']} and campaign {campaign['id']}: {str(e)}")
-                score = 75
-                explanation = "Match based on niche alignment and audience fit"
+                    # Parse response
+                    parts = response.split("EXPLANATION:")
+                    score_part = parts[0].replace("SCORE:", "").strip()
+                    score = int(''.join(filter(str.isdigit, score_part)))
+                    explanation = parts[1].strip() if len(parts) > 1 else "Good match based on niche alignment"
+                except Exception as e:
+                    logger.warning(f"AI match failed, using fallback: {str(e)}")
+                    score, explanation = calculate_match_score(
+                        profile.get('niche_tags', []),
+                        campaign.get('niche_tags', []),
+                        profile.get('follower_count', 0),
+                        campaign.get('budget', 0),
+                        profile.get('engagement_rate', 0),
+                        profile.get('pricing', 0)
+                    )
+            else:
+                # Use fallback scoring
+                score, explanation = calculate_match_score(
+                    profile.get('niche_tags', []),
+                    campaign.get('niche_tags', []),
+                    profile.get('follower_count', 0),
+                    campaign.get('budget', 0),
+                    profile.get('engagement_rate', 0),
+                    profile.get('pricing', 0)
+                )
 
             match = Match(
                 influencer_id=current_user["id"],
@@ -626,36 +674,54 @@ async def generate_matches(request: Request, current_user: dict = Depends(get_cu
 
         matches = []
         for influencer in influencers[:10]:  # Top 10 influencers
-            chat = LlmChat(
-                api_key=EMERGENT_LLM_KEY,
-                session_id=f"match_{campaign['id']}_{influencer['user_id']}",
-                system_message="You are an AI matchmaking expert for influencer marketing."
-            ).with_model("openai", "gpt-4o-mini")
+            # Calculate match score
+            if EMERGENT_AVAILABLE:
+                try:
+                    chat = LlmChat(
+                        api_key=EMERGENT_LLM_KEY,
+                        session_id=f"match_{campaign['id']}_{influencer['user_id']}",
+                        system_message="You are an AI matchmaking expert for influencer marketing."
+                    ).with_model("openai", "gpt-4o-mini")
 
-            prompt = f"""Analyze this match:
-            Campaign: {campaign['title']}
-            Campaign niches: {', '.join(campaign.get('niche_tags', []))}
-            Budget: ${campaign['budget']}
+                    prompt = f"""Analyze this match:
+                    Campaign: {campaign['title']}
+                    Campaign niches: {', '.join(campaign.get('niche_tags', []))}
+                    Budget: ${campaign['budget']}
 
-            Influencer niches: {', '.join(influencer.get('niche_tags', []))}
-            Followers: {influencer.get('follower_count', 0)}
-            Engagement: {influencer.get('engagement_rate', 0)}%
-            Pricing: ${influencer.get('pricing', 0)}
+                    Influencer niches: {', '.join(influencer.get('niche_tags', []))}
+                    Followers: {influencer.get('follower_count', 0)}
+                    Engagement: {influencer.get('engagement_rate', 0)}%
+                    Pricing: ${influencer.get('pricing', 0)}
 
-            Match score (0-100) and explanation (max 50 words).
-            Format: SCORE: [number]\nEXPLANATION: [text]"""
+                    Match score (0-100) and explanation (max 50 words).
+                    Format: SCORE: [number]\nEXPLANATION: [text]"""
 
-            message = UserMessage(text=prompt)
-            response = await chat.send_message(message)
+                    message = UserMessage(text=prompt)
+                    response = await chat.send_message(message)
 
-            try:
-                parts = response.split("EXPLANATION:")
-                score = int(''.join(filter(str.isdigit, parts[0].replace("SCORE:", "").strip())))
-                explanation = parts[1].strip() if len(parts) > 1 else "Good match"
-            except Exception as e:
-                logger.warning(f"Failed to parse AI match response for campaign {campaign['id']} and influencer {influencer['user_id']}: {str(e)}")
-                score = 75
-                explanation = "Match based on niche alignment"
+                    parts = response.split("EXPLANATION:")
+                    score = int(''.join(filter(str.isdigit, parts[0].replace("SCORE:", "").strip())))
+                    explanation = parts[1].strip() if len(parts) > 1 else "Good match"
+                except Exception as e:
+                    logger.warning(f"AI match failed, using fallback: {str(e)}")
+                    score, explanation = calculate_match_score(
+                        influencer.get('niche_tags', []),
+                        campaign.get('niche_tags', []),
+                        influencer.get('follower_count', 0),
+                        campaign.get('budget', 0),
+                        influencer.get('engagement_rate', 0),
+                        influencer.get('pricing', 0)
+                    )
+            else:
+                # Use fallback scoring
+                score, explanation = calculate_match_score(
+                    influencer.get('niche_tags', []),
+                    campaign.get('niche_tags', []),
+                    influencer.get('follower_count', 0),
+                    campaign.get('budget', 0),
+                    influencer.get('engagement_rate', 0),
+                    influencer.get('pricing', 0)
+                )
 
             match = Match(
                 influencer_id=influencer["user_id"],

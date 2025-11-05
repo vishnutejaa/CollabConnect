@@ -14,6 +14,9 @@ import bcrypt
 import jwt
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -31,8 +34,14 @@ STRIPE_API_KEY = os.environ['STRIPE_API_KEY']
 
 security = HTTPBearer()
 
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
 # Create the main app
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 api_router = APIRouter(prefix="/api")
 
 # ============ MODELS ============
@@ -46,8 +55,21 @@ class User(BaseModel):
 
 class UserRegister(BaseModel):
     email: EmailStr
-    password: str
-    user_type: str
+    password: str = Field(..., min_length=8, max_length=100)
+    user_type: str = Field(..., pattern="^(influencer|brand)$")
+
+    @staticmethod
+    def validate_password(password: str) -> str:
+        """Validate password meets security requirements"""
+        if len(password) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        if not any(c.isupper() for c in password):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not any(c.islower() for c in password):
+            raise ValueError("Password must contain at least one lowercase letter")
+        if not any(c.isdigit() for c in password):
+            raise ValueError("Password must contain at least one digit")
+        return password
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -85,11 +107,11 @@ class Campaign(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class CampaignCreate(BaseModel):
-    title: str
-    description: str
-    budget: float
-    target_audience: str = ""
-    niche_tags: List[str] = []
+    title: str = Field(..., min_length=3, max_length=200)
+    description: str = Field(..., min_length=10, max_length=5000)
+    budget: float = Field(..., gt=0, le=1000000)
+    target_audience: str = Field(default="", max_length=1000)
+    niche_tags: List[str] = Field(default=[], max_items=10)
 
 class Match(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -112,7 +134,7 @@ class Application(BaseModel):
 
 class ApplicationCreate(BaseModel):
     campaign_id: str
-    message: str = ""
+    message: str = Field(default="", max_length=2000)
 
 class ApplicationStatusUpdate(BaseModel):
     status: str
@@ -129,7 +151,7 @@ class Message(BaseModel):
 class MessageCreate(BaseModel):
     receiver_id: str
     campaign_id: str
-    content: str
+    content: str = Field(..., min_length=1, max_length=5000)
 
 class Transaction(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -149,6 +171,13 @@ class PaymentRequest(BaseModel):
     influencer_id: str
     milestone_description: str = ""
 
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+class PasswordReset(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=8, max_length=100)
+
 # ============ AUTH HELPERS ============
 
 def hash_password(password: str) -> str:
@@ -164,6 +193,27 @@ def create_token(user_id: str) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+def create_reset_token(email: str) -> str:
+    """Create a password reset token (valid for 1 hour)"""
+    payload = {
+        "email": email,
+        "purpose": "password_reset",
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+async def send_password_reset_email(email: str, token: str):
+    """Send password reset email (placeholder - configure SMTP in .env)"""
+    # In production, this would send an actual email
+    # For now, we'll just log the reset link
+    reset_link = f"http://localhost:3000/reset-password?token={token}"
+    logger.info(f"Password reset requested for {email}")
+    logger.info(f"Reset link (in production, this would be emailed): {reset_link}")
+    # TODO: Implement actual email sending when SMTP is configured
+    # import smtplib
+    # from email.mime.text import MIMEText
+    # ...
+
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         token = credentials.credentials
@@ -175,7 +225,8 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except Exception:
+    except Exception as e:
+        logger.error(f"Token validation error: {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # ============ MOCK DATA GENERATOR ============
@@ -222,7 +273,14 @@ async def generate_mock_data():
 # ============ AUTH ROUTES ============
 
 @api_router.post("/auth/register")
-async def register(user_data: UserRegister):
+@limiter.limit("5/hour")  # Prevent spam registrations
+async def register(request: Request, user_data: UserRegister):
+    # Validate password
+    try:
+        UserRegister.validate_password(user_data.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     # Check if user exists
     existing = await db.users.find_one({"email": user_data.email}, {"_id": 0})
     if existing:
@@ -238,6 +296,7 @@ async def register(user_data: UserRegister):
     user_doc["created_at"] = user_doc["created_at"].isoformat()
 
     await db.users.insert_one(user_doc)
+    logger.info(f"New user registered: {user.email} ({user.user_type})")
 
     # Create profile based on user type
     if user_data.user_type == "influencer":
@@ -251,7 +310,8 @@ async def register(user_data: UserRegister):
     return {"token": token, "user": user}
 
 @api_router.post("/auth/login")
-async def login(credentials: UserLogin):
+@limiter.limit("10/minute")  # Prevent brute force attacks
+async def login(request: Request, credentials: UserLogin):
     user = await db.users.find_one({"email": credentials.email}, {"_id": 0})
     if not user or not verify_password(credentials.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -270,16 +330,93 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
     return {**current_user, "profile": profile}
 
+@api_router.post("/auth/request-password-reset")
+@limiter.limit("3/hour")  # Prevent abuse
+async def request_password_reset(request: Request, reset_request: PasswordResetRequest):
+    """Request a password reset token"""
+    user = await db.users.find_one({"email": reset_request.email}, {"_id": 0})
+
+    # Always return success to prevent email enumeration
+    if user:
+        token = create_reset_token(reset_request.email)
+        await send_password_reset_email(reset_request.email, token)
+
+    return {"message": "If the email exists, a password reset link has been sent"}
+
+@api_router.post("/auth/reset-password")
+@limiter.limit("5/hour")
+async def reset_password(request: Request, reset_data: PasswordReset):
+    """Reset password using token"""
+    try:
+        # Validate password requirements
+        UserRegister.validate_password(reset_data.new_password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        # Decode and validate token
+        payload = jwt.decode(reset_data.token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        email = payload.get("email")
+        purpose = payload.get("purpose")
+
+        if purpose != "password_reset":
+            raise HTTPException(status_code=400, detail="Invalid token")
+
+        # Update password
+        user = await db.users.find_one({"email": email}, {"_id": 0})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        await db.users.update_one(
+            {"email": email},
+            {"$set": {"password_hash": hash_password(reset_data.new_password)}}
+        )
+
+        logger.info(f"Password reset successful for user: {email}")
+        return {"message": "Password reset successful"}
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="Reset token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid reset token")
+
 # ============ INFLUENCER ROUTES ============
 
 @api_router.get("/influencers")
-async def get_influencers(niche: Optional[str] = None):
+async def get_influencers(
+    niche: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 20,
+    min_followers: Optional[int] = None,
+    max_followers: Optional[int] = None
+):
+    """Get influencers with pagination and filtering"""
     query = {}
     if niche:
         query["niche_tags"] = {"$in": [niche]}
 
-    influencers = await db.influencer_profiles.find(query, {"_id": 0}).to_list(100)
-    return influencers
+    if min_followers is not None:
+        query["follower_count"] = {"$gte": min_followers}
+
+    if max_followers is not None:
+        if "follower_count" in query:
+            query["follower_count"]["$lte"] = max_followers
+        else:
+            query["follower_count"] = {"$lte": max_followers}
+
+    # Limit to max 100 per request
+    limit = min(limit, 100)
+
+    influencers = await db.influencer_profiles.find(query, {"_id": 0}).skip(skip).limit(limit).to_list(limit)
+    total = await db.influencer_profiles.count_documents(query)
+
+    return {
+        "data": influencers,
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "has_more": (skip + len(influencers)) < total
+    }
 
 @api_router.get("/influencers/{influencer_id}")
 async def get_influencer(influencer_id: str):
@@ -341,15 +478,43 @@ async def create_campaign(campaign_data: CampaignCreate, current_user: dict = De
     return campaign
 
 @api_router.get("/campaigns")
-async def get_campaigns(status: Optional[str] = None, niche: Optional[str] = None):
+async def get_campaigns(
+    status: Optional[str] = None,
+    niche: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 20,
+    min_budget: Optional[float] = None,
+    max_budget: Optional[float] = None
+):
+    """Get campaigns with pagination and filtering"""
     query = {}
     if status:
         query["status"] = status
     if niche:
         query["niche_tags"] = {"$in": [niche]}
 
-    campaigns = await db.campaigns.find(query, {"_id": 0}).to_list(100)
-    return campaigns
+    if min_budget is not None:
+        query["budget"] = {"$gte": min_budget}
+
+    if max_budget is not None:
+        if "budget" in query:
+            query["budget"]["$lte"] = max_budget
+        else:
+            query["budget"] = {"$lte": max_budget}
+
+    # Limit to max 100 per request
+    limit = min(limit, 100)
+
+    campaigns = await db.campaigns.find(query, {"_id": 0}).skip(skip).limit(limit).to_list(limit)
+    total = await db.campaigns.count_documents(query)
+
+    return {
+        "data": campaigns,
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "has_more": (skip + len(campaigns)) < total
+    }
 
 @api_router.get("/campaigns/{campaign_id}")
 async def get_campaign(campaign_id: str):
@@ -388,7 +553,8 @@ async def get_campaign_applications(campaign_id: str, current_user: dict = Depen
 # ============ MATCHMAKING ROUTES ============
 
 @api_router.post("/matches/generate")
-async def generate_matches(current_user: dict = Depends(get_current_user)):
+@limiter.limit("5/hour")  # Limit to 5 match generations per hour
+async def generate_matches(request: Request, current_user: dict = Depends(get_current_user)):
     """Generate AI-powered matches for influencers or brands"""
     if current_user["user_type"] == "influencer":
         # Find campaigns matching influencer's niche
@@ -427,7 +593,8 @@ async def generate_matches(current_user: dict = Depends(get_current_user)):
                 score_part = parts[0].replace("SCORE:", "").strip()
                 score = int(''.join(filter(str.isdigit, score_part)))
                 explanation = parts[1].strip() if len(parts) > 1 else "Good match based on niche alignment"
-            except:
+            except Exception as e:
+                logger.warning(f"Failed to parse AI match response for influencer {current_user['id']} and campaign {campaign['id']}: {str(e)}")
                 score = 75
                 explanation = "Match based on niche alignment and audience fit"
 
@@ -485,7 +652,8 @@ async def generate_matches(current_user: dict = Depends(get_current_user)):
                 parts = response.split("EXPLANATION:")
                 score = int(''.join(filter(str.isdigit, parts[0].replace("SCORE:", "").strip())))
                 explanation = parts[1].strip() if len(parts) > 1 else "Good match"
-            except:
+            except Exception as e:
+                logger.warning(f"Failed to parse AI match response for campaign {campaign['id']} and influencer {influencer['user_id']}: {str(e)}")
                 score = 75
                 explanation = "Match based on niche alignment"
 
@@ -582,15 +750,36 @@ async def send_message(msg_data: MessageCreate, current_user: dict = Depends(get
     return message
 
 @api_router.get("/messages/conversation/{campaign_id}")
-async def get_conversation(campaign_id: str, current_user: dict = Depends(get_current_user)):
-    messages = await db.messages.find({
+async def get_conversation(
+    campaign_id: str,
+    current_user: dict = Depends(get_current_user),
+    skip: int = 0,
+    limit: int = 50
+):
+    """Get messages with pagination"""
+    query = {
         "campaign_id": campaign_id,
         "$or": [
             {"sender_id": current_user["id"]},
             {"receiver_id": current_user["id"]}
         ]
-    }, {"_id": 0}).sort("created_at", 1).to_list(1000)
-    return messages
+    }
+
+    # Limit to max 200 per request
+    limit = min(limit, 200)
+
+    messages = await db.messages.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    # Reverse to show oldest first
+    messages.reverse()
+    total = await db.messages.count_documents(query)
+
+    return {
+        "data": messages,
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "has_more": (skip + len(messages)) < total
+    }
 
 # ============ PAYMENT ROUTES ============
 
@@ -723,13 +912,69 @@ async def get_campaign_analytics(campaign_id: str, current_user: dict = Depends(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    # Mock analytics data
+    # Calculate real analytics from database
+    # Applications count
+    applications_count = await db.applications.count_documents({"campaign_id": campaign_id})
+    accepted_applications = await db.applications.count_documents({
+        "campaign_id": campaign_id,
+        "status": "accepted"
+    })
+
+    # Messages count
+    messages_count = await db.messages.count_documents({"campaign_id": campaign_id})
+
+    # Transactions
+    transactions = await db.transactions.find({
+        "campaign_id": campaign_id,
+        "status": "completed"
+    }, {"_id": 0, "amount": 1}).to_list(100)
+
+    total_spent = sum(t.get("amount", 0) for t in transactions)
+
+    # Matches count and average score
+    matches = await db.matches.find({
+        "campaign_id": campaign_id
+    }, {"_id": 0, "match_score": 1}).to_list(100)
+
+    avg_match_score = sum(m.get("match_score", 0) for m in matches) / len(matches) if matches else 0
+
+    # Calculate estimated reach based on accepted influencers
+    accepted_apps = await db.applications.find({
+        "campaign_id": campaign_id,
+        "status": "accepted"
+    }, {"_id": 0, "influencer_id": 1}).to_list(100)
+
+    total_reach = 0
+    total_engagement = 0
+    for app in accepted_apps:
+        influencer = await db.influencer_profiles.find_one(
+            {"user_id": app["influencer_id"]},
+            {"_id": 0, "follower_count": 1, "engagement_rate": 1}
+        )
+        if influencer:
+            total_reach += influencer.get("follower_count", 0)
+            total_engagement += influencer.get("follower_count", 0) * influencer.get("engagement_rate", 0) / 100
+
+    # Calculate ROI (estimated)
+    budget = campaign.get("budget", 0)
+    estimated_conversions = int(total_engagement * 0.02) if total_engagement > 0 else 0  # 2% conversion estimate
+    roi = (estimated_conversions * 50 - total_spent) / total_spent if total_spent > 0 else 0  # Assume $50 per conversion
+
     return {
         "campaign_id": campaign_id,
-        "reach": 250000,
-        "engagement": 12500,
-        "conversions": 450,
-        "roi": 3.2
+        "campaign_title": campaign.get("title", ""),
+        "reach": int(total_reach),
+        "engagement": int(total_engagement),
+        "conversions": estimated_conversions,
+        "roi": round(roi, 2),
+        "applications_count": applications_count,
+        "accepted_applications": accepted_applications,
+        "messages_count": messages_count,
+        "total_spent": total_spent,
+        "budget": budget,
+        "budget_remaining": budget - total_spent,
+        "matches_count": len(matches),
+        "avg_match_score": round(avg_match_score, 1)
     }
 
 @api_router.get("/analytics/influencer/growth")
@@ -737,22 +982,106 @@ async def get_influencer_growth(current_user: dict = Depends(get_current_user)):
     if current_user["user_type"] != "influencer":
         raise HTTPException(status_code=403, detail="Only influencers can view growth metrics")
 
-    # Mock growth data
+    # Get influencer profile
+    profile = await db.influencer_profiles.find_one(
+        {"user_id": current_user["id"]},
+        {"_id": 0}
+    )
+
+    if not profile:
+        raise HTTPException(status_code=404, detail="Influencer profile not found")
+
+    # Count collaborations (accepted applications)
+    collaborations_count = await db.applications.count_documents({
+        "influencer_id": current_user["id"],
+        "status": "accepted"
+    })
+
+    # Count total applications
+    total_applications = await db.applications.count_documents({
+        "influencer_id": current_user["id"]
+    })
+
+    # Count matches
+    matches_count = await db.matches.count_documents({
+        "influencer_id": current_user["id"]
+    })
+
+    # Get average match score
+    matches = await db.matches.find({
+        "influencer_id": current_user["id"]
+    }, {"_id": 0, "match_score": 1}).to_list(100)
+
+    avg_match_score = sum(m.get("match_score", 0) for m in matches) / len(matches) if matches else 0
+
+    # Get total earnings from completed transactions
+    transactions = await db.transactions.find({
+        "influencer_id": current_user["id"],
+        "status": "completed"
+    }, {"_id": 0, "amount": 1}).to_list(100)
+
+    total_earnings = sum(t.get("amount", 0) for t in transactions)
+
+    # Get pending earnings
+    pending_transactions = await db.transactions.find({
+        "influencer_id": current_user["id"],
+        "status": "pending"
+    }, {"_id": 0, "amount": 1}).to_list(100)
+
+    pending_earnings = sum(t.get("amount", 0) for t in pending_transactions)
+
+    # Generate follower growth data (simulated monthly growth based on current followers)
+    # In a real app, this would come from historical tracking
+    current_followers = profile.get("follower_count", 0)
+    follower_growth = []
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    current_month = datetime.now(timezone.utc).month
+
+    for i in range(6):  # Last 6 months
+        month_idx = (current_month - 6 + i) % 12
+        # Simulate growth (current followers with slight decline for past months)
+        growth_factor = 0.85 + (i * 0.025)  # 85% to 97.5% of current
+        followers = int(current_followers * growth_factor)
+        follower_growth.append({
+            "month": months[month_idx],
+            "followers": followers
+        })
+
     return {
-        "follower_growth": [
-            {"month": "Jan", "followers": 100000},
-            {"month": "Feb", "followers": 110000},
-            {"month": "Mar", "followers": 125000}
-        ],
-        "engagement_rate": 5.2,
-        "collaborations_count": 8
+        "follower_growth": follower_growth,
+        "current_followers": current_followers,
+        "engagement_rate": profile.get("engagement_rate", 0),
+        "collaborations_count": collaborations_count,
+        "total_applications": total_applications,
+        "acceptance_rate": round((collaborations_count / total_applications * 100), 1) if total_applications > 0 else 0,
+        "matches_count": matches_count,
+        "avg_match_score": round(avg_match_score, 1),
+        "total_earnings": total_earnings,
+        "pending_earnings": pending_earnings,
+        "pricing": profile.get("pricing", 0)
     }
 
 # ============ STARTUP EVENT ============
 
 @app.on_event("startup")
 async def startup_event():
+    """Initialize application on startup"""
+    logger.info("Starting CollabConnect application...")
+
+    # Create indexes (idempotent - won't error if they exist)
+    try:
+        await db.users.create_index("email", unique=True)
+        await db.influencer_profiles.create_index("user_id", unique=True)
+        await db.brand_profiles.create_index("user_id", unique=True)
+        await db.campaigns.create_index("id", unique=True)
+        await db.matches.create_index([("influencer_id", 1), ("campaign_id", 1)], unique=True)
+        await db.applications.create_index([("influencer_id", 1), ("campaign_id", 1)], unique=True)
+        logger.info("Database indexes created/verified")
+    except Exception as e:
+        logger.warning(f"Index creation warning (may already exist): {str(e)}")
+
     await generate_mock_data()
+    logger.info("Application startup complete")
 
 app.include_router(api_router)
 
